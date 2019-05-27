@@ -4,20 +4,21 @@ import torch.nn as nn
 import sys
 import math
 sys.path.append('..')
-import utils.graph as graph
-import utils.mesh as mesh
-import utils.utils_pt as utils
+import src.utils.graph as graph
+import src.utils.mesh as mesh
+import src.utils.utils_pt as utils
 import torch.nn.functional as F
 from torch.autograd import Variable
-
+import time
 class Model(nn.Module):
 
-    def __init__(self):
+    def __init__(self, layer):
         super(Model, self).__init__()
 
-        self.conv1 = utils.GraphConv1x1(6, 128, batch_norm=None)
+        self.conv1 = utils.GraphConv1x1(3, 128, batch_norm=None)
 
-        for i in range(15):
+        self.layer = layer
+        for i in range(self.layer):
             if i % 2 == 0:
                 module = utils.LapResNet2(128)
             else:
@@ -31,7 +32,7 @@ class Model(nn.Module):
         _, num_nodes, _ = inputs.size()
         x = self.conv1(inputs)
 
-        for i in range(15):
+        for i in range(self.layer):
             x = self._modules['rn{}'.format(i)](L, mask, x)
 
         x = F.elu(x)
@@ -39,14 +40,48 @@ class Model(nn.Module):
 
         return x + inputs[:, :, -3:].repeat(1, 1, 40)
 
+class AmplifyModel(nn.Module):
+
+    def __init__(self, layer):
+        super().__init__()
+
+        self.conv1 = utils.GraphConv1x1(3, 128, batch_norm=None)
+
+        self.layer = layer
+        for i in range(self.layer):
+            if i % 2 == 0:
+                module = utils.LapResNet2(128)
+            else:
+                module = utils.AvgResNet2(128)
+            self.add_module("rn{}".format(i), module)
+
+        self.conv2 = utils.GraphConv1x1(128, 120, batch_norm="pre")
+
+    def forward(self, L_sequence, mask, inputs):
+        _, num_nodes, _ = inputs.size()
+        x = self.conv1(inputs)
+
+        for i in range(self.layer):
+            if i//2 >= len(L_sequence):
+                L = L_sequence[-1]
+            else:
+                L = L_sequence[i//2]
+            x = self._modules['rn{}'.format(i)](L, mask, x)
+
+        x = F.elu(x)
+        x = self.conv2(x)
+
+        return x + inputs[:, :, -3:].repeat(1, 1, 40)
+    
 class AvgModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, layer):
         super(AvgModel, self).__init__()
 
-        self.conv1 = utils.GraphConv1x1(6, 128, batch_norm=None)
+        self.conv1 = utils.GraphConv1x1(3, 128, batch_norm=None)
 
-        for i in range(15):
+        self.layer = layer
+        for i in range(self.layer):
             module = utils.AvgResNet2(128)
             self.add_module("rn{}".format(i), module)
 
@@ -56,7 +91,7 @@ class AvgModel(nn.Module):
         _, num_nodes, _ = inputs.size()
         x = self.conv1(inputs)
 
-        for i in range(15):
+        for i in range(self.layer):
             x = self._modules['rn{}'.format(i)](L, mask, x)
 
         x = F.elu(x)
@@ -67,12 +102,13 @@ class AvgModel(nn.Module):
 
 class MlpModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, layer):
         super(MlpModel, self).__init__()
 
-        self.conv1 = utils.GraphConv1x1(6, 128, batch_norm=None)
+        self.conv1 = utils.GraphConv1x1(3, 128, batch_norm=None)
 
-        for i in range(15):
+        self.layer = layer
+        for i in range(self.layer):
             module = utils.MlpResNet2(128)
             self.add_module("rn{}".format(i), module)
 
@@ -83,7 +119,7 @@ class MlpModel(nn.Module):
         _, num_nodes, _ = inputs.size()
         x = self.conv1(inputs)
 
-        for i in range(15):
+        for i in range(self.layer):
             x = self._modules['rn{}'.format(i)](L, mask, x)
 
         x = self.bn(x)
@@ -95,12 +131,13 @@ class MlpModel(nn.Module):
 
 class DirModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, layer):
         super(DirModel, self).__init__()
 
-        self.conv1 = utils.GraphConv1x1(6, 128, batch_norm=None)
+        self.conv1 = utils.GraphConv1x1(3, 128, batch_norm=None)
 
-        for i in range(15):
+        self.layer = layer
+        for i in range(self.layer):
             if i % 2 == 0:
                 module = utils.DirResNet2(128)
             else:
@@ -124,7 +161,7 @@ class DirModel(nn.Module):
         if v.is_cuda:
             f = f.cuda()
 
-        for i in range(15):
+        for i in range(self.layer):
             if i % 2 == 0:
                 v, f = self._modules['rn{}'.format(i)](Di, DiA, v, f)
             else:
@@ -135,3 +172,36 @@ class DirModel(nn.Module):
         x = self.conv2(x)
 
         return x + inputs[:, :, -3:].repeat(1, 1, 40)
+
+class SiameseModel(nn.Module):
+    def __init__(self, model='dirac', layer=15):
+        super().__init__()
+
+        if 'dir' in model:
+            self.model = DirModel(layer)
+        elif 'amp' in model:
+            self.model = AmplifyModel(layer)
+        elif 'lap' in model:
+            self.model = Model(layer)
+        elif 'avg' in model:
+            self.model = AvgModel(layer)
+        elif 'mlp' in model:
+            self.model = MlpModel(layer)
+
+    def forward(self, OperationA, OperationB, inputA, inputB):
+        FA = self.model(*OperationA, inputA)
+        FB = self.model(*OperationB, inputB)
+        
+        return torch.bmm(FA, FB.transpose(1,2))
+        # Batch * Nodes * Feature
+        batch_size = inputA.size(0)
+        # ||Ai-Bj||^2 = (normAi^2) + normBj^2 - 2 * AiBj
+        AB = -2 * torch.bmm(FA, FB.transpose(1,2))
+
+        sqnormA = torch.sum(FA**2, dim=2)
+        sqnormB = torch.sum(FB**2, dim=2)
+
+        # Dimension difference might be handled by broadcasting
+
+        DMat = (AB + sqnormA.view(batch_size,-1,1)) + sqnormB.view(batch_size,1,-1)
+        return DMat
